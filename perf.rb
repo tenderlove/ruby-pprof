@@ -37,15 +37,37 @@ class Profile
     counts
   end
 
+  def text
+    "Total: #{sample_count} samples\n" +
+      build_text(sample_count.to_f, flat, cumulative).join
+  end
+
   private
 
+  def build_text total, flat, cumulative
+    keys = flat.keys.sort_by { |k| flat[k] }.reverse + (cumulative.keys - flat.keys).sort.reverse
+    sum = 0
+    keys.map do |key|
+      flat_weight       = flat[key]
+      cumulative_weight = cumulative[key]
+
+      sum += flat_weight
+      sprintf "%8d %6.1f%% %6.1f%% %8d %6.1f%% %s\n",
+             flat_weight,
+             (flat_weight / total) * 100,
+             (sum / total) * 100,
+             cumulative_weight,
+             (cumulative_weight / total) * 100,
+             key
+    end
+  end
 
   def atofun address
     @addr_to_func[address] || format_pointer(address)
   end
 
   def format_pointer ptr
-    sprintf("%016x", ptr)
+    sprintf("0x%016x", ptr)
   end
 end
 
@@ -137,7 +159,7 @@ class VMCoreExec
       line_number = line_number - 1
       while line_number > 0
         if lines[line_number] =~ /DEFINE_INSN/
-          return lines[line_number + 1].chomp
+          return "vm: " + lines[line_number + 1].chomp
         end
         line_number -= 1
       end
@@ -149,7 +171,7 @@ class VMCoreExec
       line_number = line_number - 1
       while line_number > 0
         if lines[line_number] =~ /INSN_ENTRY\(([^\)]*)\)/
-          return $1
+          return "vm: " + $1
         end
         line_number -= 1
       end
@@ -163,17 +185,12 @@ RUBY_SOURCE = ARGV[2]
 
 File.open(PROFILE, 'rb') do |f|
   header = f.read(8).bytes
-  if header.all?(&:zero?)
-    puts "sixty four"
-  else
+  unless header.all?(&:zero?) # 64 bit profile
     raise "32 bit not supported"
   end
 
   left, right = f.read(8).unpack("ll")
-  if left == 3
-    # little endian
-    puts "little endian"
-  else
+  unless left == 3 # little endian
     # big endian
     raise "error" unless right == 3
     raise "64 bit big endian not supported"
@@ -198,6 +215,5 @@ File.open(PROFILE, 'rb') do |f|
   end
 
   profile = Profile.new profile, addr2func
-  #puts profile.sample_count
-  p profile.flat
+  puts profile.text
 end

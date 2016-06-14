@@ -4,7 +4,6 @@ class Profile
   def initialize prof, addr_to_func
     @prof         = prof
     @addr_to_func = addr_to_func
-    resolve_vm_exec_core prof, addr_to_func
   end
 
   def sample_count
@@ -20,9 +19,6 @@ class Profile
 
     @prof.each_pair do |stack, ticks|
       name = atofun(stack.first)
-      if name == '_vm_exec_core'
-        p :next => atofun(stack[2])
-      end
       counts[name] += ticks
     end
 
@@ -43,36 +39,6 @@ class Profile
 
   private
 
-  def resolve_vm_exec_core prof, addr_to_func
-    core_addrs = addr_to_func.find_all { |k,v| v == '_vm_exec_core' }
-    atos(core_addrs).each do |addr, func|
-      addr_to_func[addr] = func
-    end
-  end
-
-  def atos addr_to_func
-    addrs = addr_to_func.map(&:first).map { |addr| sprintf("%016x", addr) }
-
-    tempfile = Tempfile.new 'addresses'
-    tempfile.write addrs.join ' '
-    tempfile.close
-
-    locs = IO.popen("atos -o ./ruby -f #{tempfile.path}") do |f|
-      f.readlines.to_a.map { |l| l.chomp[/\([^\)]*\)$/].gsub(/[\(\)]/, '').split(':') }
-    end
-
-    addr_to_func.zip(locs).map do |(addr, default), (file, line)|
-      func = if reader = RubyFiles.for(file)
-               reader.func_for line.to_i
-             else
-               p [addr.to_s(16), file, line]
-               default
-             end
-      [addr, func]
-    end
-  ensure
-    tempfile.unlink
-  end
 
   def atofun address
     @addr_to_func[address] || format_pointer(address)
@@ -105,48 +71,97 @@ class AddrToFunction
   end
 end
 
-class RubyFiles
-  FILES = {}
-
-  def self.load file
-    new File.readlines file
+class VMCoreExec
+  def self.map src_root, bin_file, addr_to_func
+    core_addrs = addr_to_func.find_all { |k,v| v == '_vm_exec_core' }
+    resolved_insns = resolve_embedded core_addrs, src_root, bin_file
+    exec_core_insns = {}
+    core_addrs.zip(resolved_insns) do |(addr, orig), insn|
+      exec_core_insns[addr] = insn || orig
+    end
+    exec_core_insns
   end
 
-  def initialize lines
-    @lines = lines
+  # We want to blame any embedded code on the instruction they were inside.
+  # IOW, we want any functions inlined inside an instruction to weigh down
+  # that particular instruction
+  def self.resolve_embedded addr_to_func, src_root, bin_file
+    addrs = addr_to_func.map(&:first).map { |addr| sprintf("%016x", addr) }
+
+    tempfile = Tempfile.new 'addresses'
+    tempfile.write addrs.join ' '
+    tempfile.close
+
+    locs = IO.popen("atos -o #{bin_file} -f #{tempfile.path}") do |f|
+      f.readlines
+    end
+
+    last_known = nil
+    adjusted_locations = locs.map do |loc|
+      if loc =~ /vm.inc|insns.def/
+        last_known = loc
+      else
+        if last_known
+          loc = last_known
+        end
+      end
+      loc
+    end
+
+    insns  = INSNS.build File.join(src_root, 'insns.def')
+    vm_inc = VMINC.build File.join(src_root, 'vm.inc')
+
+    adjusted_locations.map do |loc|
+      file, line = loc[/\([^\)]*\)$/].gsub(/[\(\)]/, '').split(':')
+      case file
+      when /vm.inc/
+        vm_inc.func_for line.to_i
+      when /insns.def/
+        insns.func_for line.to_i
+      else
+        nil
+      end
+    end
+  ensure
+    tempfile.unlink
   end
 
-  class INSNS < RubyFiles
+  class RubyFile < Struct.new(:lines)
+    def self.build filename
+      new File.readlines filename
+    end
+  end
+
+  class INSNS < RubyFile
     def func_for line_number
+      line_number = line_number - 1
       while line_number > 0
-        if @lines[line_number] =~ /DEFINE_INSN/
-          return @lines[line_number + 1].chomp
+        if lines[line_number] =~ /DEFINE_INSN/
+          return lines[line_number + 1].chomp
         end
         line_number -= 1
       end
     end
   end
 
-  class VMINC < RubyFiles
+  class VMINC < RubyFile
     def func_for line_number
+      line_number = line_number - 1
       while line_number > 0
-        if @lines[line_number] =~ /INSN_ENTRY\(([^\)]*)\)/
+        if lines[line_number] =~ /INSN_ENTRY\(([^\)]*)\)/
           return $1
         end
         line_number -= 1
       end
     end
   end
-
-  def self.for file
-    FILES[file]
-  end
-
-  FILES['insns.def'] = INSNS.load 'insns.def'
-  FILES['vm.inc'] = VMINC.load 'vm.inc'
 end
 
-File.open(ARGV[0], 'rb') do |f|
+PROFILE     = ARGV[0]
+RUBY_BINARY = ARGV[1]
+RUBY_SOURCE = ARGV[2]
+
+File.open(PROFILE, 'rb') do |f|
   header = f.read(8).bytes
   if header.all?(&:zero?)
     puts "sixty four"
@@ -174,7 +189,15 @@ File.open(ARGV[0], 'rb') do |f|
 
     profile[f.read(8 * pcs).unpack("Q<#{pcs}")] += ticks
   end
-  profile = Profile.new profile, AddrToFunction.load("./ruby")
+
+  addr2func = AddrToFunction.load(RUBY_BINARY)
+
+  if RUBY_SOURCE
+    core_exec = VMCoreExec.map RUBY_SOURCE, RUBY_BINARY, addr2func
+    addr2func.merge! core_exec
+  end
+
+  profile = Profile.new profile, addr2func
   #puts profile.sample_count
   p profile.flat
 end
